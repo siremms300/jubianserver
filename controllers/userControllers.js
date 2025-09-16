@@ -1,0 +1,479 @@
+import User from '../models/userModel.js';
+import bcryptjs from 'bcryptjs';
+import { 
+    generateToken, 
+    generateRefreshToken,  
+    setAuthCookies, 
+    clearAuthCookies 
+} from '../utils/authUtils.js';
+import { sendEmail, verifyEmailTemplate, passwordResetTemplate, welcomeEmailTemplate, testEmail} from '../config/sendEmail.js'; 
+
+// Register User Controller
+export async function registerUserController(request, response) {
+    try {
+        const { name, email, password } = request.body;
+
+        // Validation
+        if (!name || !email || !password) {
+            return response.status(400).json({
+                message: "Please provide name, email, and password",
+                error: true,
+                success: false
+            });
+        }
+
+        if (password.length < 6) {
+            return response.status(400).json({
+                message: "Password must be at least 6 characters long",
+                error: true,
+                success: false
+            });
+        }
+
+        // Check if user already exists
+        const existingUser = await User.findOne({ email });
+        if (existingUser) {
+            return response.status(409).json({
+                message: "User already exists with this email",
+                error: true,
+                success: false
+            });
+        }
+
+        // Hash password
+        const salt = await bcryptjs.genSalt(10);
+        const hashPassword = await bcryptjs.hash(password, salt);
+
+        // Generate verification code
+        const verificationCode = Math.floor(100000 + Math.random() * 900000).toString();
+
+        // Create user with default 'user' role
+        const user = new User({
+            name,
+            email,
+            password: hashPassword,
+            role: 'user', // Default role
+            verify_Email: false,
+            forgot_password_otp: verificationCode,
+            forgot_password_expiry: Date.now() + 24 * 60 * 60 * 1000 // 24 hours
+        });
+
+        const savedUser = await user.save();
+
+        // Generate verification URL
+        const verifyEmailUrl = `${process.env.FRONTEND_URL}/verify-email?code=${verificationCode}&email=${email}`;
+
+        // Send verification email
+        try {
+            await sendEmail({
+                sendTo: email,
+                subject: "Verify Your Email - Jubian Market",
+                html: verifyEmailTemplate({
+                    name,
+                    url: verifyEmailUrl
+                })
+            });
+        } catch (emailError) {
+            console.error("Email sending failed:", emailError);
+        }
+
+        // Generate tokens
+        const token = generateToken(savedUser._id);
+        const refreshToken = generateRefreshToken(savedUser._id);
+
+        // Set cookies
+        setAuthCookies(response, token, refreshToken);
+
+        // Return response without sensitive data
+        const userResponse = {
+            _id: savedUser._id,
+            name: savedUser.name,
+            email: savedUser.email,
+            avatar: savedUser.avatar,
+            role: savedUser.role,
+            verify_Email: savedUser.verify_Email
+        };
+
+        return response.status(201).json({
+            message: "User registered successfully. Please verify your email.",
+            error: false,
+            success: true,
+            data: userResponse,
+            token,
+            refreshToken
+        });
+
+    } catch (error) {
+        console.error("Registration error:", error);
+        return response.status(500).json({
+            message: error.message || "Internal server error",
+            error: true,
+            success: false
+        });
+    }
+}
+
+// Verify Email Controller
+export async function verifyEmailController(request, response) {
+    try {
+        const { code, email } = request.body;
+
+        if (!code || !email) {
+            return response.status(400).json({
+                message: "Verification code and email are required",
+                error: true,
+                success: false
+            });
+        }
+
+        const user = await User.findOne({ 
+            email, 
+            forgot_password_otp: code,
+            forgot_password_expiry: { $gt: Date.now() }
+        });
+
+        if (!user) {
+            return response.status(400).json({
+                message: "Invalid or expired verification code",
+                error: true,
+                success: false
+            });
+        }
+
+        // Update user verification status
+        user.verify_Email = true;
+        user.forgot_password_otp = null;
+        user.forgot_password_expiry = null;
+
+        await user.save(); 
+
+
+        // ///////////////////// this is where we send welcome email to the user after they verify email 
+        try {
+            await sendEmail({
+                sendTo: email,
+                subject: "Welcome to The Jubian Marketplace",
+                html: welcomeEmailTemplate({
+                    name: user.name
+                })
+            });
+        } catch (emailError) {
+            console.error("Email sending failed:", emailError);
+        }
+
+        return response.json({
+            message: "Email verified successfully",
+            error: false,
+            success: true,
+            data: {
+                _id: user._id,
+                name: user.name,
+                email: user.email,
+                role: user.role,
+                verify_Email: user.verify_Email
+            }
+        });
+
+    } catch (error) {
+        console.error("Email verification error:", error);
+        return response.status(500).json({
+            message: error.message || "Internal server error",
+            error: true,
+            success: false
+        });
+    }
+}
+
+// Login Controller
+export async function loginUserController(request, response) {
+    try {
+        const { email, password } = request.body;
+
+        if (!email || !password) {
+            return response.status(400).json({
+                message: "Please provide email and password",
+                error: true,
+                success: false
+            });
+        }
+
+        // Find user and include password for comparison
+        const user = await User.findOne({ email }).select('+password');
+        if (!user) {
+            return response.status(401).json({
+                message: "Invalid email or password",
+                error: true,
+                success: false
+            });
+        }
+
+        // Check if email is verified
+        if (!user.verify_Email) {
+            return response.status(401).json({
+                message: "Please verify your email before logging in",
+                error: true,
+                success: false
+            });
+        }
+
+        // Check if account is active
+        if (user.status !== 'Active') {
+            return response.status(401).json({
+                message: "Your account has been suspended. Please contact support.",
+                error: true,
+                success: false
+            });
+        }
+
+        // Check password
+        const isPasswordValid = await bcryptjs.compare(password, user.password);
+        if (!isPasswordValid) {
+            return response.status(401).json({
+                message: "Invalid email or password",
+                error: true,
+                success: false
+            });
+        }
+
+        // Update last login
+        user.last_login_date = new Date();
+        await user.save();
+
+        // Generate tokens
+        const token = generateToken(user._id);
+        const refreshToken = generateRefreshToken(user._id);
+
+        // Set cookies
+        setAuthCookies(response, token, refreshToken);
+
+        // Return user data without password
+        const userResponse = {
+            _id: user._id,
+            name: user.name,
+            email: user.email,
+            avatar: user.avatar,
+            mobile: user.mobile,
+            role: user.role,
+            verify_Email: user.verify_Email,
+            last_login_date: user.last_login_date
+        };
+
+        return response.json({
+            message: "Login successful",
+            error: false,
+            success: true,
+            data: userResponse,
+            token,
+            refreshToken
+        });
+
+    } catch (error) {
+        console.error("Login error:", error);
+        return response.status(500).json({
+            message: error.message || "Internal server error",
+            error: true,
+            success: false
+        });
+    }
+}
+
+// Logout Controller
+export async function logoutUserController(request, response) {
+    try {
+        // Clear cookies
+        clearAuthCookies(response);
+
+        return response.json({
+            message: "Logout successful",
+            error: false,
+            success: true
+        });
+
+    } catch (error) {
+        console.error("Logout error:", error);
+        return response.status(500).json({
+            message: error.message || "Internal server error",
+            error: true,
+            success: false
+        });
+    }
+}
+
+// Forgot Password Controller
+export async function forgotPasswordController(request, response) {
+    try {
+        const { email } = request.body;
+
+        if (!email) {
+            return response.status(400).json({
+                message: "Email is required",
+                error: true,
+                success: false
+            });
+        }
+
+        const user = await User.findOne({ email });
+        if (!user) {
+            return response.json({
+                message: "If the email exists, a password reset link has been sent",
+                error: false,
+                success: true
+            });
+        }
+
+        // Generate OTP
+        const resetOtp = Math.floor(100000 + Math.random() * 900000).toString();
+        
+        // Save OTP with expiry (1 hour)
+        user.forgot_password_otp = resetOtp;
+        user.forgot_password_expiry = Date.now() + 60 * 60 * 1000;
+        await user.save();
+
+        // Generate reset URL
+        const resetUrl = `${process.env.FRONTEND_URL}/reset-password?code=${resetOtp}&email=${email}`;
+
+        // Send reset email
+        try {
+            await sendEmail({
+                sendTo: email,
+                subject: "Password Reset Request - BtnKeyIt",
+                html: passwordResetTemplate({
+                    name: user.name,
+                    url: resetUrl
+                })
+            });
+        } catch (emailError) {
+            console.error("Password reset email failed:", emailError);
+            return response.status(500).json({
+                message: "Failed to send reset email",
+                error: true,
+                success: false
+            });
+        }
+
+        return response.json({
+            message: "If the email exists, a password reset link has been sent",
+            error: false,
+            success: true
+        });
+
+    } catch (error) {
+        console.error("Forgot password error:", error);
+        return response.status(500).json({
+            message: error.message || "Internal server error",
+            error: true,
+            success: false
+        });
+    }
+}
+
+// Reset Password Controller
+export async function resetPasswordController(request, response) {
+    try {
+        const { email, code, newPassword } = request.body;
+
+        if (!email || !code || !newPassword) {
+            return response.status(400).json({
+                message: "Email, verification code, and new password are required",
+                error: true,
+                success: false
+            });
+        }
+
+        if (newPassword.length < 6) {
+            return response.status(400).json({
+                message: "Password must be at least 6 characters long",
+                error: true,
+                success: false
+            });
+        }
+
+        const user = await User.findOne({ 
+            email, 
+            forgot_password_otp: code,
+            forgot_password_expiry: { $gt: Date.now() }
+        });
+
+        if (!user) {
+            return response.status(400).json({
+                message: "Invalid or expired reset code",
+                error: true,
+                success: false
+            });
+        }
+
+        // Hash new password
+        const salt = await bcryptjs.genSalt(10);
+        const hashPassword = await bcryptjs.hash(newPassword, salt);
+
+        // Update password and clear OTP fields
+        user.password = hashPassword;
+        user.forgot_password_otp = null;
+        user.forgot_password_expiry = null;
+        await user.save();
+
+        return response.json({
+            message: "Password reset successfully",
+            error: false,
+            success: true
+        });
+
+    } catch (error) {
+        console.error("Reset password error:", error);
+        return response.status(500).json({
+            message: error.message || "Internal server error",
+            error: true,
+            success: false
+        });
+    }
+}
+
+// Refresh Token Controller
+export async function refreshTokenController(request, response) {
+    try {
+        const { refreshToken } = request.cookies;
+
+        if (!refreshToken) {
+            return response.status(401).json({
+                message: "Refresh token required",
+                error: true,
+                success: false
+            });
+        }
+
+        // Verify refresh token
+        const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+        const user = await User.findById(decoded.userId);
+
+        if (!user) {
+            return response.status(401).json({
+                message: "Invalid refresh token",
+                error: true,
+                success: false
+            });
+        }
+
+        // Generate new tokens
+        const newToken = generateToken(user._id);
+        const newRefreshToken = generateRefreshToken(user._id);
+
+        // Set new cookies
+        setAuthCookies(response, newToken, newRefreshToken);
+
+        return response.json({
+            message: "Token refreshed successfully",
+            error: false,
+            success: true,
+            token: newToken,
+            refreshToken: newRefreshToken
+        });
+
+    } catch (error) {
+        console.error("Refresh token error:", error);
+        return response.status(401).json({
+            message: "Invalid refresh token",
+            error: true,
+            success: false
+        });
+    }
+} 
