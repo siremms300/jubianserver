@@ -17,6 +17,10 @@ const userSchema = new mongoose.Schema({
     avatar: {
         type: String,
         default: ""
+    }, 
+    avatar_public_id: {  // Add this field to store Cloudinary public ID
+        type: String,
+        default: ""
     },
     mobile: {
         type: Number,
